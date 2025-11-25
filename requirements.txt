@@ -6,7 +6,7 @@ joblib==1.5.2
 matplotlib==3.9.4
 mediapipe==0.10.5
 numpy==1.26.4
-opencv-contrib-python==4.11.0.86
+opencv-python           
 pandas==2.3.2
 Pillow==11.3.0
 reportlab
