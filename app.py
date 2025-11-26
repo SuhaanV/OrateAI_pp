@@ -3,8 +3,10 @@ import os
 import time
 import assemblyai as aai
 import google.generativeai as genai
-from fpdf import FPDF
-from fpdf.enums import XPos, YPos
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
 from audio_recorder_streamlit import audio_recorder
 import cv2
 import mediapipe as mp
@@ -12,9 +14,41 @@ import numpy as np
 import pandas as pd
 import joblib
 from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av
 
-aai.settings.api_key = os.getenv("ASSEMBLY_API_KEY")
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+try:
+    config = st.secrets
+    ASSEMBLY_API_KEY = config["api_keys"]["assemblyai"]
+    GOOGLE_API_KEY = config["api_keys"]["google"]
+    APP_USERNAME = config["auth"]["username"]
+    APP_PASSWORD = config["auth"]["password"]
+except Exception:
+    st.error("Configuration error. Please check your secrets.toml file.")
+    st.stop()
+
+aai.settings.api_key = ASSEMBLY_API_KEY
+genai.configure(api_key=GOOGLE_API_KEY)
+
+def check_authentication():
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("Orate AI - Login")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login")
+            if submit:
+                if username == APP_USERNAME and password == APP_PASSWORD:
+                    st.session_state.authenticated = True
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+        st.stop()
+
+check_authentication()
 
 st.set_page_config(page_title="Orate AI", page_icon="🎤", layout="wide")
 
@@ -28,7 +62,10 @@ if 'ai_feedback' not in st.session_state:
     st.session_state.ai_feedback = ""
 if 'pdf_path' not in st.session_state:
     st.session_state.pdf_path = None
-
+if 'wpm' not in st.session_state:
+    st.session_state.wpm = 0
+if 'current_posture_status' not in st.session_state:
+    st.session_state.current_posture_status = "No data yet."
 
 @st.cache_resource
 def load_pose_model():
@@ -36,18 +73,28 @@ def load_pose_model():
     pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
     return pose, mp_pose
 
-
 @st.cache_resource
 def load_posture_classifier():
-    loaded = joblib.load('Final/model.pkl')
-    if isinstance(loaded, dict):
-        return loaded.get("model")
-    return loaded
+    try:
+        loaded = joblib.load('model.pkl')
+        if isinstance(loaded, dict):
+            model = loaded.get("model", None)
+        else:
+            model = loaded
+        return model if model else None
+    except Exception:
+        return None
 
+def calculate_wpm(transcript, audio_duration_ms):
+    if not transcript:
+        return 0
+    word_count = len(transcript.split())
+    duration_minutes = max((audio_duration_ms / 1000) / 60, 0.1)
+    return round(word_count / duration_minutes)
 
 def send_google(transcript_text, audience, language_style, feedback_length):
-    model = genai.GenerativeModel(model_name="gemini-2.5-flash-lite")
-    prompt_text = f"Give professional public speaking feedback and tips to improve based on this speech. Also include an improved version of the speech. "
+    model = genai.GenerativeModel(model_name="gemini-2.5-pro")
+    prompt_text = f"Give professional public speaking feedback and tips to improve based on this speech. Also include an improved version of the speech. Give the speech in human tone. "
     if audience:
         prompt_text += f"Tailor the feedback and improved speech for a target audience of {audience}. "
     if language_style:
@@ -58,57 +105,73 @@ def send_google(transcript_text, audience, language_style, feedback_length):
     response = model.generate_content(prompt_text)
     return response.text
 
-
-def pdf_export(transcript, sentiment_results, filler_data, ai_feedback):
+def pdf_export(transcript, sentiment_results, filler_data, ai_feedback, wpm):
     reports_dir = "reports"
     os.makedirs(reports_dir, exist_ok=True)
-    filename = os.path.join(reports_dir, f"orate_ai_report_{int(time.time())}.pdf")
+    filename = os.path.join(reports_dir, f"speech_report_{int(time.time())}.pdf")
+    try:
+        doc = SimpleDocTemplate(
+            filename,
+            pagesize=A4,
+            leftMargin=inch,
+            rightMargin=inch,
+            topMargin=0.75 * inch,
+            bottomMargin=0.75 * inch,
+        )
+        story = []
+        styles = getSampleStyleSheet()
+        style_title = styles['Heading1']
+        style_title.alignment = 1
+        style_heading = styles['Heading2']
+        style_body = styles['Normal']
+        story.append(Paragraph("Speech Analysis Report", style_title))
+        story.append(Spacer(1, 0.25 * inch))
+        story.append(Paragraph("Speaking Rate:", style_heading))
+        story.append(Spacer(1, 0.1 * inch))
+        story.append(Paragraph(f"Words Per Minute (WPM): <b>{wpm}</b>", style_body))
 
-    pdf = FPDF()
-    pdf.add_font('DejaVu', '', 'fonts/DejaVuSans.ttf', uni=True)
-    pdf.add_font('DejaVu', 'B', 'fonts/DejaVuSans-Bold.ttf', uni=True)
-    pdf.add_page()
+        if wpm < 130:
+            wpm_feedback = "Your speaking pace is slow. Consider speaking slightly faster."
+        elif wpm > 170:
+            wpm_feedback = "Your speaking pace is fast. Consider slowing down for clarity."
+        else:
+            wpm_feedback = "Your speaking pace is good (ideal range: 130-170 WPM)."
 
-    pdf.set_font('DejaVu', 'B', 16)
-    pdf.cell(0, 10, "Orate AI - Speech Analysis Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='C')
-    pdf.ln(10)
+        story.append(Paragraph(wpm_feedback, style_body))
+        story.append(Spacer(1, 0.25 * inch))
+        story.append(Paragraph("Transcribed Text:", style_heading))
+        story.append(Spacer(1, 0.1 * inch))
+        story.append(Paragraph(transcript or "(no transcript)", style_body))
+        story.append(Spacer(1, 0.25 * inch))
+        story.append(Paragraph("Sentiment Analysis:", style_heading))
+        story.append(Spacer(1, 0.1 * inch))
+        if sentiment_results:
+            for result in sentiment_results:
+                text_line = f'"{result.text}" &rarr; <b>{result.sentiment}</b> ({result.confidence * 100:.1f}%)'
+                story.append(Paragraph(text_line, style_body))
+        else:
+            story.append(Paragraph("No sentiment data available.", style_body))
+        story.append(Spacer(1, 0.25 * inch))
+        story.append(Paragraph("Filler Words:", style_heading))
+        story.append(Spacer(1, 0.1 * inch))
 
-    pdf.set_font('DejaVu', 'B', 12)
-    pdf.cell(0, 10, "Transcribed Text:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font('DejaVu', '', 12)
-    pdf.multi_cell(0, 8, transcript or "(no transcript)")
-    pdf.ln(5)
+        if filler_data:
+            for f in filler_data:
+                line = f"'{f['text']}' at {f['time']}s"
+                story.append(Paragraph(line, style_body))
+        else:
+            story.append(Paragraph("No filler words detected.", style_body))
+        story.append(Spacer(1, 0.25 * inch))
+        story.append(Paragraph("AI Feedback:", style_heading))
+        story.append(Spacer(1, 0.1 * inch))
 
-    pdf.set_font('DejaVu', 'B', 12)
-    pdf.cell(0, 10, "Sentiment Analysis:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font('DejaVu', '', 12)
-    if sentiment_results:
-        for result in sentiment_results:
-            line = f'"{result.text}" → {result.sentiment} ({result.confidence * 100:.1f}%)'
-            pdf.multi_cell(0, 8, line)
-    else:
-        pdf.multi_cell(0, 8, "No sentiment data available.")
-    pdf.ln(5)
-
-    pdf.set_font('DejaVu', 'B', 12)
-    pdf.cell(0, 10, "Filler Words:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font('DejaVu', '', 12)
-    if filler_data:
-        for f in filler_data:
-            line = f"'{f['text']}' at {f['time']}s"
-            pdf.multi_cell(0, 8, line)
-    else:
-        pdf.multi_cell(0, 8, "No filler words detected.")
-    pdf.ln(5)
-
-    pdf.set_font('DejaVu', 'B', 12)
-    pdf.cell(0, 10, "AI Feedback:", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font('DejaVu', '', 11)
-    pdf.multi_cell(0, 8, ai_feedback or "(no AI feedback)")
-
-    pdf.output(filename)
-    return filename
-
+        feedback_content = ai_feedback.replace('\n', '<br/>')
+        story.append(Paragraph(feedback_content or "(no AI feedback)", style_body))
+        doc.build(story)
+        return filename
+    except Exception as e:
+        st.error(f"ReportLab PDF generation failed: {str(e)}")
+        return None
 
 def process_audio(audio_bytes, audience, language_style, feedback_length):
     audio_file = "temp_audio.wav"
@@ -126,6 +189,13 @@ def process_audio(audio_bytes, audience, language_style, feedback_length):
         transcriber = aai.Transcriber(config=config)
         transcript = transcriber.transcribe(audio_file)
 
+    if transcript.status == "error":
+        st.error(f"Transcription error: {transcript.error}")
+        return None
+
+    wpm = calculate_wpm(transcript.text, transcript.audio_duration)
+    st.session_state.wpm = wpm
+
     filler_list = []
     for word in transcript.words:
         if word.text.lower() in ["um", "uh", "like", "you know"]:
@@ -140,15 +210,16 @@ def process_audio(audio_bytes, audience, language_style, feedback_length):
     st.session_state.filler_list = filler_list
     st.session_state.ai_feedback = ai_feedback
 
+    pdf_path = None
     with st.spinner("Generating PDF report..."):
-        pdf_path = pdf_export(transcript.text, transcript.sentiment_analysis, filler_list, ai_feedback)
-        st.session_state.pdf_path = pdf_path
+        pdf_path = pdf_export(transcript.text, transcript.sentiment_analysis, filler_list, ai_feedback, wpm)
+        if pdf_path:
+            st.session_state.pdf_path = pdf_path
 
     if os.path.exists(audio_file):
         os.remove(audio_file)
 
     return pdf_path
-
 
 def process_posture_frame(frame, pose, mp_pose, mp_drawing, classifier):
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -172,9 +243,14 @@ def process_posture_frame(frame, pose, mp_pose, mp_drawing, classifier):
             landmark_list.extend([lm.x, lm.y, lm.z])
 
         if classifier:
-            input_data = pd.DataFrame([landmark_list])
-            prediction = classifier.predict(input_data)
-            posture_status = str(prediction[0])
+            try:
+                input_data = pd.DataFrame([landmark_list])
+                prediction = classifier.predict(input_data)
+                posture_status = str(prediction[0])
+            except Exception:
+                posture_status = "Prediction error"
+        else:
+            posture_status = "Classifier not available"
 
         cv2.putText(image, str(posture_status), (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -184,28 +260,37 @@ def process_posture_frame(frame, pose, mp_pose, mp_drawing, classifier):
 
     return image, posture_status
 
+class PostureVideoProcessor(VideoProcessorBase):
+    def __init__(self, pose_model, mp_pose_solutions, mp_drawing_utils, classifier):
+        self.pose = pose_model
+        self.mp_pose = mp_pose_solutions
+        self.mp_drawing = mp_drawing_utils
+        self.classifier = classifier
+        self.posture_status = "Initializing..."
+        st.session_state.current_posture_status = self.posture_status
 
-st.title("🎤 Orate AI")
-st.markdown("### Professional Public Speaking & Posture Analysis")
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        processed_frame, self.posture_status = process_posture_frame(
+            img, self.pose, self.mp_pose, self.mp_drawing, self.classifier
+        )
+        st.session_state.current_posture_status = self.posture_status
+        return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
+
+st.title("Orate AI")
 
 with st.sidebar:
-    if os.path.exists("assets/logo.png"):
-        st.image("final/assets/logo.png", width=200)
-    else:
-        st.markdown("## 🎤 Orate AI")
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=300)
 
     st.markdown("---")
-    st.subheader("⚙️ Settings")
-
+    st.subheader("Settings")
     audience = st.text_input("Target Audience", placeholder="e.g., Business professionals")
     language_style = st.selectbox("Language Style", ["Understandable", "Scientific"])
     feedback_length = st.selectbox("Feedback Length", ["Summarised(200 words)", "Detailled(1000 words)"])
-
     st.markdown("---")
-    st.subheader("💡 Quick Tips")
-
+    st.subheader("Quick Tips")
     tip_choice = st.radio("Select tip:", ["Posture", "Tone", "Confidence"], label_visibility="collapsed")
-
     if tip_choice == "Posture":
         st.info("Stand tall, keep your shoulders relaxed, and face your audience confidently.")
     elif tip_choice == "Tone":
@@ -213,11 +298,18 @@ with st.sidebar:
     else:
         st.info("Practice deep breathing before you speak to calm nerves.")
 
-col1, col2 = st.columns([2, 1])
+    if st.button("Logout", use_container_width=True):
+        st.session_state.authenticated = False
+        st.rerun()
 
-with col1:
-    st.subheader("🎙️ Record Your Speech")
+pose, mp_pose = load_pose_model()
+mp_drawing = mp.solutions.drawing_utils
+classifier = load_posture_classifier()
 
+col_audio, col_video = st.columns([1, 1])
+
+with col_audio:
+    st.subheader("Audio & Analysis Controls")
     audio_bytes = audio_recorder(
         text="Click to record",
         recording_color="#e74c3c",
@@ -228,72 +320,84 @@ with col1:
     if audio_bytes:
         st.audio(audio_bytes, format="audio/wav")
 
-        if st.button("🚀 Analyze Speech", type="primary", use_container_width=True):
-            pdf_path = process_audio(audio_bytes, audience, language_style, feedback_length)
-            st.success("✅ Analysis complete!")
+        if st.button("Analyze Speech", type="primary", use_container_width=True):
+            try:
+                pdf_path = process_audio(audio_bytes, audience, language_style, feedback_length)
+                st.success("Analysis complete! Results loaded below.")
+                if not pdf_path:
+                    st.warning("PDF generation failed, but your results are displayed below.")
+            except Exception as e:
+                st.error(f"Analysis error: {str(e)}")
+                st.info("Your results may still be visible below if transcription completed.")
 
-with col2:
-    st.subheader("📹 Posture Monitor")
+    st.markdown("---")
 
-    pose, mp_pose = load_pose_model()
-    mp_drawing = mp.solutions.drawing_utils
-    classifier = load_posture_classifier()
+with col_video:
+    st.subheader("Real-time Posture Detection")
 
-    camera_input = st.camera_input("Live Posture Detection")
+    processor_factory = lambda: PostureVideoProcessor(
+        pose, mp_pose, mp_drawing, classifier
+    )
 
-    if camera_input is not None:
-        file_bytes = np.asarray(bytearray(camera_input.read()), dtype=np.uint8)
-        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    webrtc_ctx = webrtc_streamer(
+        key="posture-stream",
+        video_processor_factory=processor_factory,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-        processed_frame, posture_status = process_posture_frame(
-            frame, pose, mp_pose, mp_drawing, classifier
-        )
-
-        processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-        st.image(processed_frame, use_container_width=True)
-
-        if posture_status == "Good":
-            st.success(f"✅ {posture_status} Posture")
-        elif posture_status == "Bad":
-            st.error(f"⚠️ {posture_status} Posture")
-        else:
-            st.info(f"📊 {posture_status}")
+    status_container = st.empty()
+    if webrtc_ctx.state.playing:
+        status_container.markdown(f"**Current Posture:** **{st.session_state.current_posture_status}**")
+    else:
+        status_container.info("Click 'Start' above to begin posture detection.")
+    
 
 if st.session_state.transcript_text:
     st.markdown("---")
-    st.subheader("📊 Analysis Results")
+    st.subheader("Analysis Results")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Words Per Minute (WPM)", st.session_state.wpm)
+    with col2:
+        st.metric("Word Count", len(st.session_state.transcript_text.split()))
+    with col3:
+        st.metric("Filler Words", len(st.session_state.filler_list))
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📄 Transcript", "😊 Sentiment", "🗣️ Filler Words", "💬 AI Feedback"])
+    tab_transcript, tab_sentiment, tab_filler, tab_feedback = st.tabs(
+        ["Transcript", "Sentiment", "Filler Words", "AI Feedback"]
+    )
 
-    with tab1:
+    with tab_transcript:
         st.text_area("Transcribed Text", st.session_state.transcript_text, height=300)
 
-    with tab2:
+    with tab_sentiment:
         if st.session_state.sentiment_results:
             for result in st.session_state.sentiment_results:
-                sentiment_icon = "😊" if result.sentiment == "POSITIVE" else "😐" if result.sentiment == "NEUTRAL" else "😟"
-                st.markdown(
-                    f"{sentiment_icon} **\"{result.text}\"** → {result.sentiment} ({result.confidence * 100:.1f}%)")
+                st.markdown(f"**\"{result.text}\"** -> **{result.sentiment}** ({result.confidence * 100:.1f}%)")
         else:
             st.info("No sentiment data available")
 
-    with tab3:
+    with tab_filler:
         if st.session_state.filler_list:
             for word in st.session_state.filler_list:
-                st.markdown(f"• **'{word['text']}'** at {word['time']}s")
+                st.markdown(f"**'{word['text']}'** at **{word['time']}s**")
         else:
-            st.success("🎉 No filler words detected! Great job!")
+            st.success("No filler words detected! Great job!")
 
-    with tab4:
+    with tab_feedback:
         st.markdown(st.session_state.ai_feedback)
 
     st.markdown("---")
+
     if st.session_state.pdf_path and os.path.exists(st.session_state.pdf_path):
         with open(st.session_state.pdf_path, "rb") as f:
             st.download_button(
-                label="📥 Download PDF Report",
+                label="Download PDF Report",
                 data=f,
                 file_name=os.path.basename(st.session_state.pdf_path),
                 mime="application/pdf",
                 use_container_width=True
             )
+    elif st.session_state.transcript_text:
+        st.info("PDF generation encountered an issue, but you can copy the results above.")
