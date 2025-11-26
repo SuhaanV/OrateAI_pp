@@ -338,19 +338,30 @@ with col_video:
     processor_factory = lambda: PostureVideoProcessor(
         pose, mp_pose, mp_drawing, classifier
     )
+    
+    rtc_configuration = {
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun.nextcloud.com:443"]},
+        ]
+    }
 
     webrtc_ctx = webrtc_streamer(
         key="posture-stream",
         video_processor_factory=processor_factory,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
+        video_html_attrs={"controls": False},
+        rtc_configuration=rtc_configuration, 
     )
 
     status_container = st.empty()
-    if webrtc_ctx.state.playing:
+    
+    if webrtc_ctx.state.playing or webrtc_ctx.state.is_initializing:
         status_container.markdown(f"**Current Posture:** **{st.session_state.current_posture_status}**")
     else:
-        status_container.info("Click 'Start' above to begin posture detection.")
+        status_container.info("Click 'Start' to begin posture detection.")
     
 
 if st.session_state.transcript_text:
