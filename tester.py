@@ -3,16 +3,10 @@ import os
 import time
 import assemblyai as aai
 import google.generativeai as genai
-
-
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.colors import black
+from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
-
-
-
 from audio_recorder_streamlit import audio_recorder
 import cv2
 import mediapipe as mp
@@ -20,6 +14,8 @@ import numpy as np
 import pandas as pd
 import joblib
 from PIL import Image
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
+import av
 
 try:
     config = st.secrets
@@ -34,19 +30,16 @@ except Exception:
 aai.settings.api_key = ASSEMBLY_API_KEY
 genai.configure(api_key=GOOGLE_API_KEY)
 
-
 def check_authentication():
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
 
     if not st.session_state.authenticated:
         st.title("Orate AI - Login")
-
         with st.form("login_form"):
             username = st.text_input("Username")
             password = st.text_input("Password", type="password")
             submit = st.form_submit_button("Login")
-
             if submit:
                 if username == APP_USERNAME and password == APP_PASSWORD:
                     st.session_state.authenticated = True
@@ -54,7 +47,6 @@ def check_authentication():
                 else:
                     st.error("Invalid username or password")
         st.stop()
-
 
 check_authentication()
 
@@ -72,14 +64,14 @@ if 'pdf_path' not in st.session_state:
     st.session_state.pdf_path = None
 if 'wpm' not in st.session_state:
     st.session_state.wpm = 0
-
+if 'current_posture_status' not in st.session_state:
+    st.session_state.current_posture_status = "No data yet."
 
 @st.cache_resource
 def load_pose_model():
     mp_pose = mp.solutions.pose
     pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
     return pose, mp_pose
-
 
 @st.cache_resource
 def load_posture_classifier():
@@ -93,16 +85,12 @@ def load_posture_classifier():
     except Exception:
         return None
 
-
 def calculate_wpm(transcript, audio_duration_ms):
     if not transcript:
         return 0
-
     word_count = len(transcript.split())
     duration_minutes = max((audio_duration_ms / 1000) / 60, 0.1)
-
     return round(word_count / duration_minutes)
-
 
 def send_google(transcript_text, audience, language_style, feedback_length):
     model = genai.GenerativeModel(model_name="gemini-2.5-pro")
@@ -117,17 +105,11 @@ def send_google(transcript_text, audience, language_style, feedback_length):
     response = model.generate_content(prompt_text)
     return response.text
 
-
-# --- DELETE: clean_text_for_pdf and safe_multi_cell (ReportLab handles encoding and wrapping) ---
-
-# --- REPLACED pdf_export function with ReportLab PLATYPUS implementation ---
 def pdf_export(transcript, sentiment_results, filler_data, ai_feedback, wpm):
     reports_dir = "reports"
     os.makedirs(reports_dir, exist_ok=True)
     filename = os.path.join(reports_dir, f"speech_report_{int(time.time())}.pdf")
-
     try:
-        # Initialize Document and Styles
         doc = SimpleDocTemplate(
             filename,
             pagesize=A4,
@@ -136,24 +118,17 @@ def pdf_export(transcript, sentiment_results, filler_data, ai_feedback, wpm):
             topMargin=0.75 * inch,
             bottomMargin=0.75 * inch,
         )
-        story = []  # List of elements (Flowables) to be added to the PDF
+        story = []
         styles = getSampleStyleSheet()
-
-        # Define Custom Styles
         style_title = styles['Heading1']
-        style_title.alignment = 1  # Center
+        style_title.alignment = 1
         style_heading = styles['Heading2']
         style_body = styles['Normal']
-
-        # --- 1. Title ---
         story.append(Paragraph("Speech Analysis Report", style_title))
         story.append(Spacer(1, 0.25 * inch))
-
-        # --- 2. Speaking Rate ---
         story.append(Paragraph("Speaking Rate:", style_heading))
         story.append(Spacer(1, 0.1 * inch))
-
-        story.append(Paragraph(f"Words Per Minute (WPM): **{wpm}**", style_body))
+        story.append(Paragraph(f"Words Per Minute (WPM): <b>{wpm}</b>", style_body))
 
         if wpm < 130:
             wpm_feedback = "Your speaking pace is slow. Consider speaking slightly faster."
@@ -162,30 +137,21 @@ def pdf_export(transcript, sentiment_results, filler_data, ai_feedback, wpm):
         else:
             wpm_feedback = "Your speaking pace is good (ideal range: 130-170 WPM)."
 
-        # ReportLab supports basic HTML tags like <b> and <br/>
         story.append(Paragraph(wpm_feedback, style_body))
         story.append(Spacer(1, 0.25 * inch))
-
-        # --- 3. Transcribed Text ---
         story.append(Paragraph("Transcribed Text:", style_heading))
         story.append(Spacer(1, 0.1 * inch))
         story.append(Paragraph(transcript or "(no transcript)", style_body))
         story.append(Spacer(1, 0.25 * inch))
-
-        # --- 4. Sentiment Analysis ---
         story.append(Paragraph("Sentiment Analysis:", style_heading))
         story.append(Spacer(1, 0.1 * inch))
-
         if sentiment_results:
             for result in sentiment_results:
-                # Use tags for formatting
                 text_line = f'"{result.text}" &rarr; <b>{result.sentiment}</b> ({result.confidence * 100:.1f}%)'
                 story.append(Paragraph(text_line, style_body))
         else:
             story.append(Paragraph("No sentiment data available.", style_body))
         story.append(Spacer(1, 0.25 * inch))
-
-        # --- 5. Filler Words ---
         story.append(Paragraph("Filler Words:", style_heading))
         story.append(Spacer(1, 0.1 * inch))
 
@@ -196,25 +162,16 @@ def pdf_export(transcript, sentiment_results, filler_data, ai_feedback, wpm):
         else:
             story.append(Paragraph("No filler words detected.", style_body))
         story.append(Spacer(1, 0.25 * inch))
-
-        # --- 6. AI Feedback ---
         story.append(Paragraph("AI Feedback:", style_heading))
         story.append(Spacer(1, 0.1 * inch))
 
-        # ReportLab supports line breaks via <br/> and handles long text wrapping
         feedback_content = ai_feedback.replace('\n', '<br/>')
         story.append(Paragraph(feedback_content or "(no AI feedback)", style_body))
-
-        # --- Build the PDF ---
         doc.build(story)
         return filename
-
     except Exception as e:
         st.error(f"ReportLab PDF generation failed: {str(e)}")
         return None
-
-
-# --- Rest of the code remains the same ---
 
 def process_audio(audio_bytes, audience, language_style, feedback_length):
     audio_file = "temp_audio.wav"
@@ -264,7 +221,6 @@ def process_audio(audio_bytes, audience, language_style, feedback_length):
 
     return pdf_path
 
-
 def process_posture_frame(frame, pose, mp_pose, mp_drawing, classifier):
     image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose.process(image)
@@ -304,6 +260,22 @@ def process_posture_frame(frame, pose, mp_pose, mp_drawing, classifier):
 
     return image, posture_status
 
+class PostureVideoProcessor(VideoProcessorBase):
+    def __init__(self, pose_model, mp_pose_solutions, mp_drawing_utils, classifier):
+        self.pose = pose_model
+        self.mp_pose = mp_pose_solutions
+        self.mp_drawing = mp_drawing_utils
+        self.classifier = classifier
+        self.posture_status = "Initializing..."
+        st.session_state.current_posture_status = self.posture_status
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        img = frame.to_ndarray(format="bgr24")
+        processed_frame, self.posture_status = process_posture_frame(
+            img, self.pose, self.mp_pose, self.mp_drawing, self.classifier
+        )
+        st.session_state.current_posture_status = self.posture_status
+        return av.VideoFrame.from_ndarray(processed_frame, format="bgr24")
 
 st.title("Orate AI")
 
@@ -313,16 +285,12 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Settings")
-
     audience = st.text_input("Target Audience", placeholder="e.g., Business professionals")
     language_style = st.selectbox("Language Style", ["Understandable", "Scientific"])
     feedback_length = st.selectbox("Feedback Length", ["Summarised(200 words)", "Detailled(1000 words)"])
-
     st.markdown("---")
     st.subheader("Quick Tips")
-
     tip_choice = st.radio("Select tip:", ["Posture", "Tone", "Confidence"], label_visibility="collapsed")
-
     if tip_choice == "Posture":
         st.info("Stand tall, keep your shoulders relaxed, and face your audience confidently.")
     elif tip_choice == "Tone":
@@ -342,7 +310,6 @@ col_audio, col_video = st.columns([1, 1])
 
 with col_audio:
     st.subheader("Audio & Analysis Controls")
-
     audio_bytes = audio_recorder(
         text="Click to record",
         recording_color="#e74c3c",
@@ -368,43 +335,27 @@ with col_audio:
 with col_video:
     st.subheader("Real-time Posture Detection")
 
-    run_camera = st.checkbox("Start Camera Feed", key="start_camera_main")
+    processor_factory = lambda: PostureVideoProcessor(
+        pose, mp_pose, mp_drawing, classifier
+    )
 
-    stframe = st.empty()
-    status_text = st.empty()
+    webrtc_ctx = webrtc_streamer(
+        key="posture-stream",
+        video_processor_factory=processor_factory,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-    if run_camera:
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Could not open webcam. Check your camera permissions.")
-        else:
-            stop_button = st.button("Stop Camera Feed", key="stop_camera_main", use_container_width=True)
-
-            while run_camera and not stop_button:
-                ret, frame = cap.read()
-                if not ret:
-                    st.warning("Failed to grab frame")
-                    break
-
-                processed_frame, posture_status = process_posture_frame(
-                    frame, pose, mp_pose, mp_drawing, classifier
-                )
-
-                processed_frame = cv2.cvtColor(processed_frame, cv2.COLOR_BGR2RGB)
-                stframe.image(processed_frame, channels="RGB", use_container_width=True)
-                status_text.markdown(f"**Current Posture:** **{posture_status}**")
-
-                time.sleep(0.03)
-
-            cap.release()
-            st.info("Camera feed stopped")
+    status_container = st.empty()
+    if webrtc_ctx.state.playing:
+        status_container.markdown(f"**Current Posture:** **{st.session_state.current_posture_status}**")
     else:
-        status_text.info("Check 'Start Camera Feed' to begin posture detection.")
+        status_container.info("Click 'Start' above to begin posture detection.")
+    
 
 if st.session_state.transcript_text:
     st.markdown("---")
     st.subheader("Analysis Results")
-
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("Words Per Minute (WPM)", st.session_state.wpm)
