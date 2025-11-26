@@ -17,29 +17,20 @@ from PIL import Image
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 import av
 
-# --- START CONFIGURATION BLOCK (TEMPORARILY BYPASSED) ---
-# NOTE: The app will run, but AI/transcription features will fail
-# because the API keys are not loaded/configured properly.
 try:
     config = st.secrets
-    ASSEMBLY_API_KEY = config.get("api_keys", {}).get("assemblyai", "")
-    GOOGLE_API_KEY = config.get("api_keys", {}).get("google", "")
-    APP_USERNAME = config.get("auth", {}).get("username", "user")
-    APP_PASSWORD = config.get("auth", {}).get("password", "pass")
+    ASSEMBLY_API_KEY = config["api_keys"]["assemblyai"]
+    GOOGLE_API_KEY = config["api_keys"]["google"]
+    APP_USERNAME = config["auth"]["username"]
+    APP_PASSWORD = config["auth"]["password"]
 except Exception:
-    # Set dummy values if secrets file is missing to allow the app to run
-    ASSEMBLY_API_KEY = ""
-    GOOGLE_API_KEY = ""
-    APP_USERNAME = "user"
-    APP_PASSWORD = "pass"
-# --- END CONFIGURATION BLOCK ---
+    st.error("Configuration error. Please check your secrets.toml file.")
+    st.stop()
 
-# Initialize API settings (these will likely fail later if keys are empty)
 aai.settings.api_key = ASSEMBLY_API_KEY
 genai.configure(api_key=GOOGLE_API_KEY)
 
 def check_authentication():
-    # NOTE: Functionality is kept but the call below is commented out
     if 'authenticated' not in st.session_state:
         st.session_state.authenticated = False
 
@@ -57,7 +48,7 @@ def check_authentication():
                     st.error("Invalid username or password")
         st.stop()
 
-# check_authentication() # <--- TEMPORARILY COMMENTED OUT TO RENDER THE APP
+check_authentication()
 
 st.set_page_config(page_title="Orate AI", page_icon="🎤", layout="wide")
 
@@ -331,7 +322,6 @@ with col_audio:
 
         if st.button("Analyze Speech", type="primary", use_container_width=True):
             try:
-                # Note: This analysis step will likely fail if API keys are empty
                 pdf_path = process_audio(audio_bytes, audience, language_style, feedback_length)
                 st.success("Analysis complete! Results loaded below.")
                 if not pdf_path:
@@ -348,30 +338,19 @@ with col_video:
     processor_factory = lambda: PostureVideoProcessor(
         pose, mp_pose, mp_drawing, classifier
     )
-    
-    rtc_configuration = {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302"]},
-            {"urls": ["stun:stun1.l.google.com:19302"]},
-            {"urls": ["stun:stun.nextcloud.com:443"]},
-        ]
-    }
 
     webrtc_ctx = webrtc_streamer(
         key="posture-stream",
         video_processor_factory=processor_factory,
         media_stream_constraints={"video": True, "audio": False},
         async_processing=True,
-        video_html_attrs={"controls": False},
-        rtc_configuration=rtc_configuration, 
     )
 
     status_container = st.empty()
-    
     if webrtc_ctx.state.playing:
         status_container.markdown(f"**Current Posture:** **{st.session_state.current_posture_status}**")
     else:
-        status_container.info("Click 'Start' to begin posture detection.")
+        status_container.info("Click 'Start' above to begin posture detection.")
     
 
 if st.session_state.transcript_text:
