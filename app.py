@@ -358,7 +358,7 @@ with col_video:
 
     status_container = st.empty()
     
-    if webrtc_ctx.state.playing or webrtc_ctx.state.is_initializing:
+    if webrtc_ctx.state.playing: # FIX: Removed .is_initializing
         status_container.markdown(f"**Current Posture:** **{st.session_state.current_posture_status}**")
     else:
         status_container.info("Click 'Start' to begin posture detection.")
